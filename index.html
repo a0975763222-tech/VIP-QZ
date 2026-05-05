@@ -1,118 +1,139 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, query, orderBy } from 'firebase/firestore';
+import { getFirestore, collection, onSnapshot, doc, setDoc } from 'firebase/firestore';
 import { 
-  TrendingDown, TrendingUp, RefreshCcw, 
+  TrendingDown, TrendingUp, RefreshCw, 
   Apple, Smartphone, ShieldCheck, Clock,
-  LayoutDashboard, Zap, Target, Smartphone as SamsungIcon,
-  Monitor, Smartphone as MobileIcon, ChevronRight
+  LayoutDashboard, Zap, Target, Palette, Search, Monitor, 
+  Smartphone as MobileIcon, ChevronRight, AlertCircle, Database
 } from 'lucide-react';
 
-// Firebase 配置 (環境自動注入)
-const firebaseConfig = JSON.parse(__firebase_config);
+// --- Firebase 基礎配置 (由系統自動注入) ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+  apiKey: "",
+  authDomain: "qz-price-hub.firebaseapp.com",
+  projectId: "qz-price-hub",
+  storageBucket: "qz-price-hub.firebasestorage.app",
+};
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'VIP-QZ';
 
 const App = () => {
   const [user, setUser] = useState(null);
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
   const [lastSync, setLastSync] = useState("");
+  const [activeBrand, setActiveBrand] = useState('apple');
+  const [connectionStatus, setConnectionStatus] = useState('connecting');
 
-  // 1. 認證初始化
+  // --- 1. 根據 PDF 建立的 114-115 年官方名單 (即使斷網也會顯示) ---
+  const pdfMasterList = useMemo(() => [
+    { model: "iPhone 17 (256G/512G)", brand: "apple", colors: "黑/白/霧藍/薰衣草紫/鼠尾草綠", landmark: 32900, jiesheng: 32500, sogi: 32600, storePrice: 32400 },
+    { model: "iPhone 17 Pro Max (256G-2T)", brand: "apple", colors: "銀/宇宙橙/藏藍", landmark: 44900, jiesheng: 44500, sogi: 44600, storePrice: 44300 },
+    { model: "iPhone 17 Pro (256G-1T)", brand: "apple", colors: "銀/宇宙橙/藏藍", landmark: 40400, jiesheng: 40000, sogi: 40100, storePrice: 39900 },
+    { model: "iPhone Air (256G/512G)", brand: "apple", colors: "太空黑/雲白/淺金/天藍", landmark: 35900, jiesheng: 35500, sogi: 35600, storePrice: 35400 },
+    { model: "iPhone 17e (256G/512G)", brand: "apple", colors: "黑/白/粉", landmark: 28900, jiesheng: 28500, sogi: 28600, storePrice: 28400 },
+    { model: "Galaxy S25 Ultra (16G/256G-1T)", brand: "samsung", colors: "鈦黑/鈦灰/鈦紫/鈦藍", landmark: 38500, jiesheng: 38100, sogi: 38200, storePrice: 38000 },
+    { model: "Pixel 10 Pro XL", brand: "google", colors: "曜石黑/月岩灰/綠玉色/陶瓷米", landmark: 39900, jiesheng: 39500, sogi: 39600, storePrice: 39400 },
+    { model: "Vivo V40 Pro / 5G", brand: "vivo", colors: "星海紫/冰晶藍/黑", landmark: 18900, jiesheng: 18500, sogi: 18600, storePrice: 18400 }
+  ], []);
+
+  // --- 2. 身份驗證 (遵循 Rule 3) ---
   useEffect(() => {
     const initAuth = async () => {
-      if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth Fail:", err);
       }
     };
     initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
+    onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      if (u) setConnectionStatus('online');
+    });
+    // 設定一個超時，避免黑畫面
+    const timer = setTimeout(() => {
+      setLoading(false);
+      if (data.length === 0) setData(pdfMasterList);
+    }, 3000);
+    return () => clearTimeout(timer);
   }, []);
 
-  // 2. 監聽雲端即時數據 (R1 & R2 規範)
+  // --- 3. 監聽數據 (遵循 Rule 1) ---
   useEffect(() => {
     if (!user) return;
     const q = collection(db, 'artifacts', appId, 'public', 'data', 'iphone_prices');
     const unsubscribe = onSnapshot(q, (snapshot) => {
       const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      // 依品牌排序：Apple 在前，Samsung 在後
-      const sorted = docs.sort((a, b) => (a.brand === 'apple' ? -1 : 1));
-      setData(sorted.length > 0 ? sorted : getMockData());
+      // 將雲端抓到的最新價格疊加到 PDF 名單上
+      const merged = pdfMasterList.map(m => {
+        const cloud = docs.find(d => d.model?.includes(m.model.split('(')[0].trim()));
+        return cloud ? { ...m, ...cloud } : m;
+      });
+      setData(merged);
       setLoading(false);
       setLastSync(new Date().toLocaleTimeString());
     }, (err) => {
-      console.error("Firestore Error:", err);
+      console.error("Firestore Fail:", err);
+      setData(pdfMasterList);
       setLoading(false);
     });
     return () => unsubscribe();
-  }, [user]);
+  }, [user, pdfMasterList]);
 
-  const getMockData = () => [
-    { model: 'iPhone 17 (256G)', landmark: 32500, jiesheng: 32490, sogi: 32600, storePrice: 32400, brand: 'apple' },
-    { model: 'iPhone 17 Pro Max (256G)', landmark: 44900, jiesheng: 44800, sogi: 45000, storePrice: 44700, brand: 'apple' },
-    { model: 'Galaxy S25 Ultra (256G)', landmark: 38500, jiesheng: 38300, sogi: 38600, storePrice: 38200, brand: 'samsung' }
-  ];
+  const format = (n) => n > 0 ? "NT$ " + n.toLocaleString() : "---";
 
-  const formatPrice = (p) => p ? `NT$ ${p.toLocaleString()}` : "---";
-
-  const PriceCard = ({ item }) => {
-    const lowest = Math.min(item.landmark || 99999, item.jiesheng || 99999, item.sogi || 99999);
-    const storePrice = item.storePrice || (lowest - 100);
+  const Card = ({ item }) => {
+    const lowest = Math.min(...[item.landmark, item.jiesheng, item.sogi].filter(p => p > 0));
+    const storePrice = item.storePrice || (lowest > 0 ? lowest - 100 : 0);
     const diff = storePrice - lowest;
 
     return (
-      <div className={`group relative overflow-hidden rounded-[2.5rem] border-l-[12px] p-6 shadow-2xl transition-all hover:scale-[1.02] ${
+      <div className={`rounded-[3rem] border-l-[20px] p-10 mb-10 shadow-2xl transition-all hover:scale-[1.02] relative overflow-hidden group ${
         item.brand === 'apple' ? 'bg-slate-800 border-slate-400' : 'bg-blue-950/40 border-blue-600'
       }`}>
-        <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center mb-6 gap-4">
-          <div>
-            <h3 className="text-3xl md:text-4xl font-black text-white group-hover:text-blue-400 transition-colors leading-tight">
-              {item.model}
-            </h3>
-            <div className="flex gap-2 mt-2">
-              <span className="bg-white/10 text-white/60 px-3 py-1 rounded-lg text-xs font-bold tracking-widest uppercase italic">256GB Edition</span>
-              <span className="bg-green-500/20 text-green-400 px-3 py-1 rounded-lg text-xs font-bold flex items-center gap-1">
-                <Zap size={14} /> LIVE 同步中
-              </span>
+        <div className="flex flex-col xl:flex-row justify-between items-start xl:items-center mb-8 gap-8">
+          <div className="flex-1">
+            <h3 className="text-5xl md:text-7xl font-black italic tracking-tighter uppercase mb-4 leading-none text-white">{item.model}</h3>
+            <div className="flex flex-wrap items-center gap-4">
+              <span className="bg-white/10 text-white/50 px-5 py-2 rounded-xl text-sm font-black tracking-widest uppercase italic">114-115 OFFICIAL</span>
+              <div className="bg-blue-600/20 text-blue-400 px-6 py-2 rounded-2xl flex items-center gap-3 font-black text-2xl">
+                <Palette size={28} /> {item.colors}
+              </div>
             </div>
           </div>
-          <div className="text-right">
-            <p className="text-slate-500 text-xs font-bold tracking-widest mb-1 uppercase">店內限時報價</p>
-            <p className="text-5xl md:text-6xl font-black text-white tracking-tighter shadow-blue-500/20 drop-shadow-lg">{formatPrice(storePrice)}</p>
+          <div className="text-right bg-black/40 p-10 rounded-[3.5rem] border border-white/10 min-w-[380px]">
+            <p className="text-slate-500 text-sm font-black mb-2 uppercase tracking-[0.4em] italic opacity-60 text-center md:text-right">今日店內標價</p>
+            <p className="text-7xl md:text-9xl font-black text-blue-400 tracking-tighter">{format(storePrice)}</p>
           </div>
         </div>
-
-        <div className="grid grid-cols-3 gap-4 bg-black/40 rounded-3xl p-6 mb-6 border border-white/5">
+        <div className="grid grid-cols-3 gap-8 bg-black/50 rounded-[3.5rem] p-10 mb-8 border border-white/5 shadow-inner">
           <div className="text-center border-r border-white/10">
-            <p className="text-red-500 font-black text-sm mb-1">地標網通</p>
-            <p className="text-2xl font-black text-white">{item.landmark?.toLocaleString() || "---"}</p>
+            <p className="text-red-500 font-black text-2xl mb-4 uppercase italic">地標</p>
+            <p className="text-4xl md:text-5xl font-black text-white">{item.landmark?.toLocaleString() || "---"}</p>
           </div>
           <div className="text-center border-r border-white/10">
-            <p className="text-green-500 font-black text-sm mb-1">傑昇通信</p>
-            <p className="text-2xl font-black text-white">{item.jiesheng?.toLocaleString() || "---"}</p>
+            <p className="text-green-500 font-black text-2xl mb-4 uppercase italic">傑昇</p>
+            <p className="text-4xl md:text-5xl font-black text-white">{item.jiesheng?.toLocaleString() || "---"}</p>
           </div>
           <div className="text-center">
-            <p className="text-orange-500 font-black text-sm mb-1">手機王報價</p>
-            <p className="text-2xl font-black text-white">{item.sogi?.toLocaleString() || "---"}</p>
+            <p className="text-orange-500 font-black text-2xl mb-4 uppercase italic">手機王</p>
+            <p className="text-4xl md:text-5xl font-black text-white">{item.sogi?.toLocaleString() || "---"}</p>
           </div>
         </div>
-
-        <div className="flex justify-between items-center bg-white/5 rounded-2xl p-4 border border-white/10">
-          <div className="flex items-center gap-2 text-yellow-400 font-bold text-lg">
-            <Target size={24} /> 市場最低: {lowest.toLocaleString()}
-          </div>
-          <div className={`flex items-center gap-2 px-6 py-2 rounded-2xl font-black text-xl shadow-lg ${
-            diff <= 0 ? 'bg-green-500 text-white' : 'bg-red-500 text-white'
-          }`}>
-            {diff <= 0 ? <TrendingDown size={28} /> : <TrendingUp size={28} />}
-            {diff === 0 ? '平盤' : `${diff > 0 ? '+' : ''}${diff}`}
+        <div className="flex flex-col md:flex-row justify-between items-center bg-white/5 px-12 py-8 rounded-[3rem] border border-white/10 font-black text-4xl italic">
+          <span className="text-yellow-400 flex items-center gap-4"><Target size={48} /> 市場最低參考：{lowest > 0 ? lowest.toLocaleString() : '等待連線'}</span>
+          <div className={`px-16 py-6 rounded-[2.5rem] flex items-center gap-5 shadow-2xl ${diff <= 0 ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}>
+             {diff <= 0 ? <TrendingDown size={54} /> : <TrendingUp size={54} />}
+             <span>{diff === 0 ? '平盤' : (diff > 0 ? "+" + diff.toLocaleString() : diff.toLocaleString())}</span>
           </div>
         </div>
       </div>
@@ -120,100 +141,55 @@ const App = () => {
   };
 
   if (loading) return (
-    <div className="h-screen bg-[#020617] flex flex-col items-center justify-center text-white p-6 text-center">
-      <div className="w-24 h-24 border-8 border-blue-600 border-t-transparent rounded-full animate-spin mb-8 shadow-blue-500/50 shadow-xl"></div>
-      <h2 className="text-4xl font-black tracking-widest animate-pulse">銓展戰情系統啟動中...</h2>
+    <div className="h-screen bg-[#020617] flex flex-col items-center justify-center text-white p-12 text-center">
+      <RefreshCw className="animate-spin mb-10 text-blue-500" size={120} />
+      <h2 className="text-6xl md:text-8xl font-black tracking-widest animate-pulse uppercase italic">銓展系統啟動中</h2>
+      <p className="mt-8 text-slate-500 text-3xl font-bold italic">正在連接 114-115 年全品牌雲端資料庫...</p>
     </div>
   );
 
   return (
-    <div className="min-h-screen bg-[#020617] text-slate-100 font-sans selection:bg-blue-500 selection:text-white">
-      {/* 21:9 極寬頁首 */}
-      <header className="p-6 md:p-10 flex flex-col md:flex-row justify-between items-center border-b border-white/10 bg-slate-900/50 backdrop-blur-md sticky top-0 z-50">
-        <div className="flex items-center gap-8">
-          <div className="bg-gradient-to-br from-blue-600 to-indigo-700 p-6 rounded-[2rem] shadow-2xl shadow-blue-600/40 group hover:scale-110 transition-transform">
-            <LayoutDashboard size={60} className="text-white" />
+    <div className="min-h-screen bg-[#020617] text-slate-100 p-8 md:p-16 font-sans selection:bg-blue-600">
+      <header className="flex flex-col xl:flex-row justify-between items-center mb-20 border-b border-white/10 pb-16 gap-12 sticky top-0 bg-[#020617]/95 backdrop-blur-3xl z-50 py-12 px-10 rounded-b-[5rem]">
+        <div className="flex items-center gap-12">
+          <div className="bg-gradient-to-br from-blue-600 to-indigo-700 p-10 rounded-[3.5rem] shadow-2xl shadow-blue-500/40 hover:scale-110 transition-transform">
+            <LayoutDashboard size={100} className="text-white" />
           </div>
           <div>
-            <h1 className="text-6xl md:text-8xl font-black tracking-tighter uppercase italic">
-              LIVE <span className="text-blue-500">戰情室</span>
+            <h1 className="text-8xl md:text-[12rem] font-black italic tracking-tighter uppercase leading-none">
+              Live <span className="text-blue-500 underline decoration-[25px] underline-offset-[25px] decoration-blue-500/20">戰情室</span>
             </h1>
-            <div className="flex items-center gap-3 mt-2">
-              <span className="w-4 h-4 bg-green-500 rounded-full animate-ping"></span>
-              <p className="text-slate-400 text-2xl font-bold flex items-center gap-2 italic">
-                <Clock size={24} /> 雲端同步中 | 最後更新：{lastSync}
-              </p>
+            <div className="flex items-center gap-6 mt-10">
+              <div className={`flex items-center gap-5 px-10 py-3 rounded-full border font-black text-4xl italic ${connectionStatus === 'online' ? 'bg-green-500/10 border-green-500/30 text-green-400' : 'bg-red-500/10 border-red-500/30 text-red-400'}`}>
+                 <span className={`h-6 w-6 rounded-full ${connectionStatus === 'online' ? 'bg-green-500 animate-ping' : 'bg-red-500 animate-pulse'}`}></span>
+                 {connectionStatus === 'online' ? `雲端即時同步中 | ${lastSync}` : '雲端離線模式 (顯示預設規格)'}
+              </div>
             </div>
           </div>
         </div>
-
-        <div className="flex items-center gap-10 mt-8 md:mt-0">
-           <div className="text-right">
-              <p className="text-slate-500 font-bold tracking-[0.5em] text-xl mb-1 uppercase opacity-50">Est. 1989</p>
-              <h2 className="text-5xl md:text-7xl font-black text-white tracking-tight">銓 / 昇 展 通 信</h2>
-           </div>
-           <div className="h-24 w-[3px] bg-gradient-to-b from-blue-600 to-transparent hidden lg:block"></div>
-           <div className="hidden lg:flex flex-col gap-2">
-              <div className="flex items-center gap-3 bg-white/5 border border-white/10 px-8 py-3 rounded-2xl font-bold text-xl">
-                 <ShieldCheck className="text-blue-500" /> 安全連線已加密
-              </div>
-              <div className="flex items-center gap-3 bg-green-500/10 border border-green-500/20 px-8 py-3 rounded-2xl font-bold text-xl text-green-400">
-                 <Zap className="text-green-500" /> 市場數據即時更新
-              </div>
-           </div>
+        <nav className="flex flex-wrap justify-center gap-8 bg-slate-900/80 p-6 rounded-[4rem] border border-white/10 shadow-3xl">
+          {['apple', 'samsung', 'google', 'others'].map(b => (
+            <button key={b} onClick={() => setActiveBrand(b)} className={`px-14 py-7 rounded-[3rem] text-4xl md:text-6xl font-black uppercase transition-all tracking-tighter ${activeBrand === b ? 'bg-blue-600 text-white shadow-2xl scale-110' : 'text-slate-500 hover:text-white'}`}>{b}</button>
+          ))}
+        </nav>
+        <div className="text-right hidden xl:block min-w-[400px]">
+           <p className="text-slate-600 font-black tracking-[1.2em] text-2xl mb-5 uppercase italic opacity-40 italic">SINCE 1989</p>
+           <h2 className="text-8xl font-black text-white tracking-tighter leading-none">銓 / 昇 展 通 信</h2>
         </div>
       </header>
 
-      {/* 數據核心區塊 */}
-      <main className="p-6 md:p-10">
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-12">
-          {/* Apple Section */}
-          <div className="space-y-8">
-            <div className="flex items-center gap-4 px-6 mb-4">
-              <div className="bg-slate-700 p-4 rounded-3xl shadow-xl"><Apple size={48} className="text-white" fill="currentColor" /></div>
-              <h2 className="text-6xl font-black text-slate-200 tracking-tighter uppercase">Apple Series</h2>
-            </div>
-            {data.filter(i => i.brand === 'apple').map((item, idx) => (
-              <PriceCard key={idx} item={item} />
-            ))}
-          </div>
-
-          {/* Samsung Section */}
-          <div className="space-y-8">
-            <div className="flex items-center gap-4 px-6 mb-4">
-              <div className="bg-blue-600 p-4 rounded-3xl shadow-xl"><SamsungIcon size={48} className="text-white" /></div>
-              <h2 className="text-6xl font-black text-blue-500 tracking-tighter uppercase">Samsung Series</h2>
-            </div>
-            {data.filter(i => i.brand === 'samsung').map((item, idx) => (
-              <PriceCard key={idx} item={item} />
-            ))}
-          </div>
-        </div>
+      <main className="grid grid-cols-1 gap-16 max-w-[2800px] mx-auto">
+        {data.filter(i => i.brand === (activeBrand === 'others' ? 'vivo' : activeBrand)).map((item, idx) => <Card key={idx} item={item} />)}
       </main>
 
-      {/* 超寬頁尾 */}
-      <footer className="mt-20 p-12 bg-slate-900/80 border-t border-white/10 flex flex-col md:flex-row justify-between items-center gap-10">
-        <div className="flex flex-col md:flex-row items-center gap-10">
-           <div className="text-center md:text-left">
-              <h3 className="text-4xl font-black text-white mb-2 tracking-widest">銓 / 昇 展 通 信</h3>
-              <p className="text-slate-400 text-2xl font-medium tracking-tight flex items-center justify-center md:justify-start gap-2">
-                <ShieldCheck className="text-blue-500" size={24} /> SINCE 1989 | 誠信經營，您的戰情後盾
-              </p>
-           </div>
-           <div className="h-16 w-[1px] bg-slate-700 hidden md:block"></div>
-           <div className="text-slate-300 space-y-2 text-center md:text-left">
-              <p className="text-2xl font-bold">桃園市龜山區中興路 402 號</p>
-              <p className="text-xl opacity-60 font-medium">電話：03-3590858 | 統編：80089553</p>
-           </div>
+      <footer className="mt-48 p-24 bg-slate-950/90 rounded-[8rem] border-t border-white/5 text-center md:text-left flex flex-col md:flex-row justify-between items-center gap-12 opacity-50 hover:opacity-100 transition-opacity">
+        <div>
+           <h3 className="text-8xl font-black text-white mb-6 tracking-[0.4em]">銓 / 昇 展 通 信</h3>
+           <p className="text-4xl text-slate-400 font-black italic">專業服務三十載，您的戰情後盾</p>
         </div>
-        
-        <div className="flex gap-6">
-           <div className="flex items-center gap-2 bg-slate-800 border border-white/10 px-6 py-3 rounded-2xl text-slate-400 font-bold">
-              <Monitor size={24} /> 21:9 寬螢幕模式
-           </div>
-           <div className="flex items-center gap-2 bg-slate-800 border border-white/10 px-6 py-3 rounded-2xl text-slate-400 font-bold">
-              <MobileIcon size={24} /> 手機適應模式
-           </div>
+        <div className="text-slate-300 space-y-4 font-black">
+           <p className="text-5xl tracking-tighter">桃園市龜山區中興路 402 號</p>
+           <p className="text-3xl opacity-50 tracking-tighter">服務專線：03-3590858 | 統一編號：80089553</p>
         </div>
       </footer>
     </div>
